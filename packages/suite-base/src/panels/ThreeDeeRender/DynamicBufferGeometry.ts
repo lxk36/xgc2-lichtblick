@@ -49,6 +49,11 @@ export class DynamicBufferGeometry extends THREE.BufferGeometry {
       return;
     }
 
+    // Grow with headroom: point counts often fluctuate by a few vertices per frame.
+    // Build replacements before disposing so allocation/validation failures leave the
+    // currently rendered attributes intact.
+    const capacity = Math.max(itemCount, Math.ceil(this.#itemCapacity * 1.5));
+    const replacements = new Map<string, THREE.BufferAttribute>();
     for (const [attributeName, attribute] of Object.entries(this.attributes)) {
       const dataConstructor = this.#attributeConstructors.get(attributeName);
       if (!dataConstructor) {
@@ -56,12 +61,18 @@ export class DynamicBufferGeometry extends THREE.BufferGeometry {
           `DynamicBufferGeometry resize(${itemCount}) failed, missing data constructor for attribute "${attributeName}". Attributes must be created using createAttribute().`,
         );
       }
-      const data = new dataConstructor(itemCount * attribute.itemSize);
+      const data = new dataConstructor(capacity * attribute.itemSize);
       const newAttrib = new THREE.BufferAttribute(data, attribute.itemSize, attribute.normalized);
       newAttrib.setUsage(this.#usage);
-      this.setAttribute(attributeName, newAttrib);
+      replacements.set(attributeName, newAttrib);
     }
 
-    this.#itemCapacity = itemCount;
+    // Three.js must see the OLD attributes when its dispose listener deletes GPU buffers.
+    // The geometry object remains reusable; the next render uploads the replacements.
+    this.dispose();
+    for (const [attributeName, attribute] of replacements) {
+      this.setAttribute(attributeName, attribute);
+    }
+    this.#itemCapacity = capacity;
   }
 }

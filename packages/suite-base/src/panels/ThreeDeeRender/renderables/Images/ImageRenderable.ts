@@ -109,6 +109,8 @@ const MAX_VIDEO_FRAME_HISTORY_BYTES = 64 * 1024 * 1024;
  */
 const MAX_PENDING_VIDEO_DECODE_FRAMES = 2000;
 const MAX_PENDING_VIDEO_DECODE_BYTES = 64 * 1024 * 1024;
+// Keep limited parallelism for independent bitmap decoders without building an unbounded backlog.
+const MAX_CONCURRENT_IMAGE_DECODES = 2;
 
 type PendingVideoDecode = {
   image: AnyImage;
@@ -196,6 +198,10 @@ export class ImageRenderable extends Renderable<ImageUserData> {
   #receivedImageSequenceNumber = 0;
   #displayedImageSequenceNumber = 0;
   #showingErrorImage = false;
+  // Independent images need no GOP: keep only the newest waiting frame and two active decodes.
+  // Coalesce before worker postMessage/createImageBitmap, not after the expensive work.
+  #pendingImageDecode: PendingVideoDecode | undefined;
+  #activeImageDecodes = 0;
   // Decoder config parsed from the most recent keyframe. Delta frames carry no parameter sets, so
   // they reuse this instead of reparsing the SPS.
   #cachedVideoDecoderConfig?: VideoDecoderConfig;
@@ -258,6 +264,7 @@ export class ImageRenderable extends Renderable<ImageUserData> {
 
   public override dispose(): void {
     this.#disposed = true;
+    this.#pendingImageDecode = undefined;
     const textureImage = this.userData.texture?.image;
     if (textureImage instanceof ImageBitmap) {
       closeGraphicResource(textureImage);
@@ -356,6 +363,9 @@ export class ImageRenderable extends Renderable<ImageUserData> {
   }
 
   public setImage(image: AnyImage, resizeWidth?: number, onDecoded?: () => void): void {
+    if (this.isDisposed()) {
+      return;
+    }
     this.userData.image = image;
 
     const seq = ++this.#receivedImageSequenceNumber;
@@ -419,9 +429,37 @@ export class ImageRenderable extends Renderable<ImageUserData> {
       return;
     }
 
-    // Raw (non-video) images decode in parallel; the `#displayedImageSequenceNumber > seq` guard
-    // inside `#startDecode` drops late results.
-    void this.#startDecode(image, seq, resizeWidth, onDecoded);
+    this.#pendingImageDecode = { image, seq, resizeWidth, onDecoded };
+    if (this.#activeImageDecodes < MAX_CONCURRENT_IMAGE_DECODES) {
+      this.#activeImageDecodes++;
+      void this.#drainPendingImageDecodes();
+    }
+  }
+
+  async #drainPendingImageDecodes(): Promise<void> {
+    try {
+      while (!this.isDisposed() && this.#pendingImageDecode != undefined) {
+        const pending = this.#pendingImageDecode;
+        this.#pendingImageDecode = undefined;
+        const videoDecodeEpoch = this.#videoDecodeEpoch;
+        try {
+          // Paint the active result even when another image is waiting. Dropping every active
+          // result under sustained load would starve the display. Only waiting images coalesce.
+          await this.#startDecode(
+            pending.image,
+            pending.seq,
+            pending.resizeWidth,
+            pending.onDecoded,
+            { videoDecodeEpoch },
+          );
+        } catch (err) {
+          // Even failure to create the error bitmap must not wedge the queue or reject unhandled.
+          log.error(err);
+        }
+      }
+    } finally {
+      this.#activeImageDecodes--;
+    }
   }
 
   #cachedCanonicalCodec(format: string): VideoCodec | undefined {
@@ -439,6 +477,7 @@ export class ImageRenderable extends Renderable<ImageUserData> {
     nextVideoFormat: string | undefined,
   ): void {
     this.#videoDecodeEpoch++;
+    this.#pendingImageDecode = undefined;
     this.#codec = nextCodec;
     this.#videoFormat = nextVideoFormat;
     this.#cachedVideoDecoderConfig = undefined;
@@ -484,6 +523,7 @@ export class ImageRenderable extends Renderable<ImageUserData> {
    */
   public resetVideoForSeek(): void {
     this.#videoDecodeEpoch++;
+    this.#pendingImageDecode = undefined;
     this.videoPlayer?.resetForSeek();
     this.#waitingForVideoKeyframe = true;
     this.#canReplayVideoGop = true;
@@ -570,7 +610,7 @@ export class ImageRenderable extends Renderable<ImageUserData> {
         this.renderer.queueAnimationFrame();
       }
     } catch (err) {
-      if (this.isDisposed()) {
+      if (this.isDisposed() || this.#displayedImageSequenceNumber > seq) {
         return;
       }
       if (
@@ -581,15 +621,30 @@ export class ImageRenderable extends Renderable<ImageUserData> {
       }
       log.error(err);
       if (!this.#showingErrorImage) {
-        await this.#setErrorImage(seq, onDecoded);
+        await this.#setErrorImage(seq, onDecoded, options?.videoDecodeEpoch);
+      }
+      if (
+        this.isDisposed() ||
+        this.#displayedImageSequenceNumber > seq ||
+        (options?.videoDecodeEpoch != undefined &&
+          options.videoDecodeEpoch !== this.#videoDecodeEpoch)
+      ) {
+        return;
       }
       this.addError(DECODE_IMAGE_ERR_KEY, `Error decoding image: ${(err as Error).message}`);
     }
   }
 
-  async #setErrorImage(seq: number, onDecoded?: () => void): Promise<void> {
+  async #setErrorImage(
+    seq: number,
+    onDecoded?: () => void,
+    videoDecodeEpoch?: number,
+  ): Promise<void> {
     const errorBitmap = await getErrorImage(64, 64);
-    if (this.isDisposed()) {
+    if (
+      this.isDisposed() ||
+      (videoDecodeEpoch != undefined && videoDecodeEpoch !== this.#videoDecodeEpoch)
+    ) {
       closeGraphicResource(errorBitmap);
       return;
     }

@@ -6,7 +6,6 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/
 
 import EventEmitter from "eventemitter3";
-import * as _ from "lodash-es";
 import * as THREE from "three";
 import { Key } from "ts-key-enum";
 
@@ -51,6 +50,9 @@ export class Input extends EventEmitter<InputEvents> {
   /** Size in CSS pixels */
   public canvasSize: THREE.Vector2;
   readonly #resizeObserver: ResizeObserver;
+  #resizeFrame: number | undefined;
+  #stopDrag: (() => void) | undefined;
+  #disposed = false;
   #startClientPos?: THREE.Vector2;
   #cursorCoords = new THREE.Vector2();
   #worldSpaceCursorCoords?: THREE.Vector3;
@@ -69,12 +71,11 @@ export class Input extends EventEmitter<InputEvents> {
 
     this.#canvas = canvas;
     this.canvasSize = new THREE.Vector2();
-    this.#onResize([]);
+    this.#onResize();
 
-    // Calling the resize observer too often causes Chrome to throw an exception
-    // so we debounce it.
-    const debouncedOnResize = _.debounce(this.#onResize);
-    this.#resizeObserver = new ResizeObserver(debouncedOnResize);
+    // Coalesce layout changes into one measurement per display frame, outside
+    // the observer delivery cycle. Keep the handle so disposal cancels the work.
+    this.#resizeObserver = new ResizeObserver(this.#scheduleResize);
     this.#resizeObserver.observe(parentEl);
 
     canvas.addEventListener("mousedown", this.#onMouseDown);
@@ -90,6 +91,12 @@ export class Input extends EventEmitter<InputEvents> {
 
   public dispose(): void {
     const canvas = this.#canvas;
+    this.#disposed = true;
+    if (this.#resizeFrame != undefined) {
+      cancelAnimationFrame(this.#resizeFrame);
+      this.#resizeFrame = undefined;
+    }
+    this.#stopDrag?.();
 
     this.removeAllListeners();
     this.#resizeObserver.disconnect();
@@ -110,22 +117,40 @@ export class Input extends EventEmitter<InputEvents> {
    * handled on the window and `onUpdate()` will be called until mouseup occurs.
    */
   public trackDrag(onUpdate: (cursorCoords: THREE.Vector2) => void): void {
+    this.#stopDrag?.();
+    if (this.#disposed) {
+      return;
+    }
     const listener = (event: MouseEvent) => {
       event.preventDefault();
       this.#updateCursorCoords(event);
       onUpdate(this.#cursorCoords);
     };
+    const stop = () => {
+      window.removeEventListener("mousemove", listener);
+      window.removeEventListener("mouseup", stop);
+      window.removeEventListener("blur", stop);
+      this.#stopDrag = undefined;
+    };
+    this.#stopDrag = stop;
     window.addEventListener("mousemove", listener);
-    window.addEventListener(
-      "mouseup",
-      () => {
-        window.removeEventListener("mousemove", listener);
-      },
-      { once: true },
-    );
+    window.addEventListener("mouseup", stop);
+    window.addEventListener("blur", stop);
   }
 
-  #onResize = (_entries: ResizeObserverEntry[]): void => {
+  #scheduleResize = (): void => {
+    if (this.#disposed || this.#resizeFrame != undefined) {
+      return;
+    }
+    this.#resizeFrame = requestAnimationFrame(() => {
+      this.#resizeFrame = undefined;
+      if (!this.#disposed) {
+        this.#onResize();
+      }
+    });
+  };
+
+  #onResize = (): void => {
     if (this.#canvas.parentElement) {
       const newSize = innerSize(this.#canvas.parentElement);
       if (isNaN(newSize.width) || isNaN(newSize.height)) {

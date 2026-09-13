@@ -61,15 +61,15 @@ export class DynamicInstancedMesh<
   }
 
   #setCount(count: number) {
-    while (count >= this.#capacity) {
-      this.#expand();
+    if (count > this.#capacity) {
+      // Compute the target first. A large incoming marker batch must not allocate
+      // and copy every intermediate capacity, and an exact fit needs no growth.
+      do {
+        this.#capacity += Math.trunc(this.#capacity / 2) + 16;
+      } while (count > this.#capacity);
+      this.#resize();
     }
     this.count = count;
-  }
-
-  #expand() {
-    this.#capacity = this.#capacity + Math.trunc(this.#capacity / 2) + 16;
-    this.#resize();
   }
 
   #resize() {
@@ -86,6 +86,9 @@ export class DynamicInstancedMesh<
       newColorArray.set(oldColorArray);
     }
 
+    // Dispose only the mesh's instance buffers, never its shared geometry/material.
+    // This must happen before replacing the attributes observed by WebGLObjects.
+    this.dispose();
     this.instanceMatrix = new THREE.InstancedBufferAttribute(newMatrixArray, 16);
     this.instanceColor = new THREE.InstancedBufferAttribute(newColorArray, 3, true);
 
